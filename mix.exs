@@ -1,7 +1,7 @@
 defmodule ReqLLM.MixProject do
   use Mix.Project
 
-  @version "1.17.0"
+  @version "1.17.1"
   @source_url "https://github.com/agentjido/req_llm"
 
   def project do
