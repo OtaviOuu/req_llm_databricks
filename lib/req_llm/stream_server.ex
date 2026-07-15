@@ -69,6 +69,7 @@ defmodule ReqLLM.StreamServer do
 
   alias ReqLLM.MapAccess
   alias ReqLLM.StreamChunk
+  alias ReqLLM.Streaming.Failure
   alias ReqLLM.Streaming.SSE
 
   require Logger
@@ -98,7 +99,7 @@ defmodule ReqLLM.StreamServer do
     metadata: %{},
     stream_requested?: false,
     metadata_delivered?: false,
-    halt_delivered?: false,
+    terminal_delivered?: false,
     completion_cleanup_after: 30_000,
     completion_cleanup_timer: nil,
     completion_cleanup_token: nil,
@@ -369,7 +370,10 @@ defmodule ReqLLM.StreamServer do
   ## Returns
 
     * `{:ok, metadata}` - Final stream metadata
-    * `{:error, reason}` - Error occurred or timeout
+    * `{:error, :timeout}` - Metadata was not available before the timeout
+
+  Failed streams return `{:ok, metadata}` with `:finish_reason` set to `:error`
+  and the structured failure under `:error`.
 
   ## Examples
 
@@ -437,15 +441,20 @@ defmodule ReqLLM.StreamServer do
       {:empty, new_state} ->
         case state.status do
           :done ->
-            halted_state = %{new_state | halt_delivered?: true}
+            terminal_state = %{new_state | terminal_delivered?: true}
 
-            case finalize_lifecycle(halted_state) do
+            case finalize_lifecycle(terminal_state) do
               {:stop, final_state} -> {:stop, :normal, :halt, final_state}
               {:continue, final_state} -> {:reply, :halt, final_state}
             end
 
           {:error, reason} ->
-            {:reply, {:error, reason}, new_state}
+            terminal_state = %{new_state | terminal_delivered?: true}
+
+            case finalize_lifecycle(terminal_state) do
+              {:stop, final_state} -> {:stop, :normal, {:error, reason}, final_state}
+              {:continue, final_state} -> {:reply, {:error, reason}, final_state}
+            end
 
           _ ->
             {:noreply, register_waiting_caller(new_state, from, :next, timeout)}
@@ -554,16 +563,11 @@ defmodule ReqLLM.StreamServer do
 
   @impl GenServer
   def handle_call({:await_metadata, _timeout}, _from, %{status: :done} = state) do
-    new_state = %{state | metadata_delivered?: true}
-
-    case finalize_lifecycle(new_state) do
-      {:stop, final_state} -> {:stop, :normal, {:ok, final_state.metadata}, final_state}
-      {:continue, final_state} -> {:reply, {:ok, final_state.metadata}, final_state}
-    end
+    reply_with_metadata(state)
   end
 
-  def handle_call({:await_metadata, _timeout}, _from, %{status: {:error, reason}} = state) do
-    {:reply, {:error, reason}, state}
+  def handle_call({:await_metadata, _timeout}, _from, %{status: {:error, _reason}} = state) do
+    reply_with_metadata(state)
   end
 
   def handle_call({:await_metadata, timeout}, from, state) do
@@ -635,11 +639,11 @@ defmodule ReqLLM.StreamServer do
 
   @impl GenServer
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
-    case {MapSet.member?(state.consumer_refs, ref), state.status} do
-      {true, :done} ->
+    case {MapSet.member?(state.consumer_refs, ref), terminal_status?(state.status)} do
+      {true, true} ->
         {:noreply, %{state | consumer_refs: MapSet.delete(state.consumer_refs, ref)}}
 
-      {true, _status} ->
+      {true, false} ->
         new_state =
           %{state | consumer_refs: MapSet.delete(state.consumer_refs, ref)}
           |> finalize_cancelled_stream()
@@ -648,7 +652,7 @@ defmodule ReqLLM.StreamServer do
 
         {:stop, :normal, new_state}
 
-      {false, _status} ->
+      {false, _terminal?} ->
         {:noreply, state}
     end
   end
@@ -784,6 +788,10 @@ defmodule ReqLLM.StreamServer do
     %{state | blocked_http_event: nil, pending_http_calls: :queue.new()}
   end
 
+  defp process_http_event(_event, %{status: {:error, _reason}} = state) do
+    {:reply, :ok, state}
+  end
+
   defp process_http_event({:status, status}, state) do
     new_state = %{state | http_status: status}
     {:reply, :ok, new_state}
@@ -810,8 +818,7 @@ defmodule ReqLLM.StreamServer do
 
       new_state =
         state
-        |> Map.put(:status, {:error, error})
-        |> maybe_emit_stream_exception(error)
+        |> finalize_failed_stream(error)
         |> reply_to_waiting_callers()
 
       {:reply, :ok, new_state}
@@ -828,10 +835,14 @@ defmodule ReqLLM.StreamServer do
   defp process_http_event({:error, reason}, state) do
     new_state =
       state
-      |> Map.put(:status, {:error, reason})
-      |> maybe_emit_stream_exception(reason)
+      |> finalize_failed_stream(reason)
       |> reply_to_waiting_callers()
 
+    {:reply, :ok, new_state}
+  end
+
+  defp process_http_event({:cancelled, _reason}, state) do
+    new_state = state |> finalize_cancelled_stream() |> reply_to_waiting_callers()
     {:reply, :ok, new_state}
   end
 
@@ -868,6 +879,7 @@ defmodule ReqLLM.StreamServer do
   defp store_pending_http_exit(state, _reason), do: state
 
   defp process_http_task_exit(%{status: :done} = state, _reason), do: state
+  defp process_http_task_exit(%{status: {:error, _reason}} = state, _exit_reason), do: state
 
   defp process_http_task_exit(state, reason) when reason in [:normal, :shutdown] do
     finalize_stream_with_fixture(state)
@@ -878,9 +890,7 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp process_http_task_exit(state, reason) do
-    state
-    |> Map.put(:status, {:error, {:http_task_failed, reason}})
-    |> maybe_emit_stream_exception({:http_task_failed, reason})
+    finalize_failed_stream(state, {:http_task_failed, reason})
   end
 
   defp parse_protocol_events(chunk, state) do
@@ -1335,6 +1345,31 @@ defmodule ReqLLM.StreamServer do
     Map.delete(meta, :terminal?)
   end
 
+  defp error_metadata(state, reason) do
+    state
+    |> extract_final_metadata()
+    |> Map.put(:finish_reason, :error)
+    |> Map.put(:error, reason)
+  end
+
+  defp finalize_failed_stream(state, reason) do
+    metadata = error_metadata(state, reason)
+
+    state
+    |> Map.put(:status, {:error, reason})
+    |> Map.put(:metadata, metadata)
+    |> maybe_emit_stream_exception(reason)
+  end
+
+  defp reply_with_metadata(state) do
+    new_state = %{state | metadata_delivered?: true}
+
+    case finalize_lifecycle(new_state) do
+      {:stop, final_state} -> {:stop, :normal, {:ok, final_state.metadata}, final_state}
+      {:continue, final_state} -> {:reply, {:ok, final_state.metadata}, final_state}
+    end
+  end
+
   defp reply_to_waiting_callers(state) do
     {replied_callers, remaining_callers} =
       Enum.split_with(state.waiting_callers, fn caller ->
@@ -1368,11 +1403,11 @@ defmodule ReqLLM.StreamServer do
 
       {{:empty, _}, :done} ->
         GenServer.reply(from, :halt)
-        %{state | halt_delivered?: true}
+        %{state | terminal_delivered?: true}
 
       {{:empty, _}, {:error, reason}} ->
         GenServer.reply(from, {:error, reason})
-        state
+        %{state | terminal_delivered?: true}
 
       {{:empty, _}, _} ->
         GenServer.reply(from, {:error, :unexpected_empty_queue})
@@ -1388,11 +1423,11 @@ defmodule ReqLLM.StreamServer do
 
   defp reply_to_caller(
          %{from: from, type: :metadata} = caller,
-         %{status: {:error, reason}} = state
+         %{status: {:error, _reason}} = state
        ) do
     cancel_waiting_caller_timer(caller)
-    GenServer.reply(from, {:error, reason})
-    state
+    GenServer.reply(from, {:ok, state.metadata})
+    %{state | metadata_delivered?: true}
   end
 
   defp reply_to_caller(%{from: from, type: :metadata} = caller, state) do
@@ -1470,7 +1505,7 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp ready_to_stop?(state) do
-    state.status == :done and state.metadata_delivered? and state.halt_delivered? and
+    terminal_status?(state.status) and state.metadata_delivered? and state.terminal_delivered? and
       :queue.is_empty(state.queue)
   end
 
@@ -1488,10 +1523,14 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp should_schedule_completion_cleanup?(state) do
-    state.status == :done and state.metadata_delivered? and not state.stream_requested? and
-      not state.halt_delivered? and is_integer(state.completion_cleanup_after) and
+    terminal_status?(state.status) and state.metadata_delivered? and not state.stream_requested? and
+      not state.terminal_delivered? and is_integer(state.completion_cleanup_after) and
       state.completion_cleanup_after >= 0
   end
+
+  defp terminal_status?(:done), do: true
+  defp terminal_status?({:error, _reason}), do: true
+  defp terminal_status?(_status), do: false
 
   defp ensure_completion_cleanup_timer(%{completion_cleanup_timer: nil} = state) do
     token = make_ref()
@@ -1512,33 +1551,7 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp build_http_error(status, chunk, headers) do
-    case Jason.decode(chunk) do
-      {:ok, %{"error" => error_data}} when is_map(error_data) ->
-        message = Map.get(error_data, "message", "HTTP #{status}")
-
-        ReqLLM.Error.API.Request.exception(
-          reason: message,
-          status: status,
-          response_body: error_data,
-          headers: headers
-        )
-
-      {:ok, decoded} ->
-        ReqLLM.Error.API.Request.exception(
-          reason: "HTTP #{status}",
-          status: status,
-          response_body: decoded,
-          headers: headers
-        )
-
-      {:error, _} ->
-        ReqLLM.Error.API.Request.exception(
-          reason: "HTTP #{status}",
-          status: status,
-          response_body: chunk,
-          headers: headers
-        )
-    end
+    Failure.api_error(status, chunk, headers)
   end
 
   # Normalize streaming usage data from provider format to ReqLLM format
@@ -1577,7 +1590,17 @@ defmodule ReqLLM.StreamServer do
   defp maybe_emit_stream_exception(%{telemetry: nil} = state, _reason), do: state
 
   defp maybe_emit_stream_exception(%{telemetry: telemetry} = state, reason) do
-    %{state | telemetry: ReqLLM.Telemetry.exception_request(telemetry, reason)}
+    usage = state.metadata[:usage]
+
+    telemetry =
+      ReqLLM.Telemetry.exception_request(telemetry, reason,
+        http_status: state.http_status,
+        usage: usage,
+        builtin_tool_timing: state.builtin_tool_timing,
+        emit_token_usage?: is_map(usage)
+      )
+
+    %{state | telemetry: telemetry}
   end
 
   defp maybe_put_request_id(meta, nil), do: meta
