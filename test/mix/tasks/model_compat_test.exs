@@ -235,6 +235,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompatTest do
       assert result.status == :fail
       assert result.total == 0
       assert result.error == "No matching compatibility tests executed"
+      assert result.failure_layer == "planning"
     end
 
     test "accepts successful invocations that execute a matching test" do
@@ -250,6 +251,19 @@ defmodule Mix.Tasks.ReqLlm.ModelCompatTest do
       assert result.status == :pass
       assert result.total == 1
       assert result.error == nil
+      assert result.failure_layer == nil
+    end
+  end
+
+  describe "support_operation/2" do
+    test "normalizes inferred model types for all-operation discovery" do
+      assert ModelCompat.support_operation(%{"type" => "text"}, :all) == :text
+      assert ModelCompat.support_operation(%{"type" => "embedding"}, :all) == :embedding
+      assert ModelCompat.support_operation(%{"type" => "unknown"}, :all) == :unknown
+    end
+
+    test "preserves an explicitly selected operation" do
+      assert ModelCompat.support_operation(%{"type" => "embedding"}, :text) == :text
     end
   end
 
