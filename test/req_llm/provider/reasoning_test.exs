@@ -11,6 +11,7 @@ defmodule ReqLLM.Provider.ReasoningTest do
     test "preserves the documented legacy aliases" do
       assert Reasoning.normalize_options(reasoning: true) == [reasoning_effort: :medium]
       assert Reasoning.normalize_options(reasoning: "high") == [reasoning_effort: :high]
+      assert Reasoning.normalize_options(reasoning: "max") == [reasoning_effort: :max]
       assert Reasoning.normalize_options(reasoning: "none") == [reasoning_effort: :none]
       assert Reasoning.normalize_options(reasoning: "auto") == []
       assert Reasoning.normalize_options(reasoning: false) == []
@@ -20,7 +21,7 @@ defmodule ReqLLM.Provider.ReasoningTest do
     end
 
     test "uses one effort normalizer for accepted string values" do
-      for effort <- [:none, :minimal, :low, :medium, :high, :xhigh, :default] do
+      for effort <- [:none, :minimal, :low, :medium, :high, :xhigh, :max, :default] do
         assert Reasoning.normalize_effort(Atom.to_string(effort)) == effort
         assert Reasoning.normalize_effort(effort) == effort
       end
@@ -182,6 +183,7 @@ defmodule ReqLLM.Provider.ReasoningTest do
 
       assert [
                %{kind: :clamped, option: :reasoning_effort},
+               %{kind: :clamped, option: :reasoning_effort},
                %{kind: :lossy, option: :reasoning_effort}
              ] =
                Reasoning.advisories(
@@ -190,6 +192,12 @@ defmodule ReqLLM.Provider.ReasoningTest do
                  [reasoning_effort: :xhigh],
                  google_thinking_level: :high
                ) ++
+                 Reasoning.advisories(
+                   Google,
+                   model,
+                   [reasoning_effort: :max],
+                   google_thinking_level: :high
+                 ) ++
                  Reasoning.advisories(
                    Google,
                    model,
