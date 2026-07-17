@@ -149,11 +149,17 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
       "response.reasoning.delta" ->
         text = data["delta"] || ""
-        if text == "", do: [], else: [ReqLLM.StreamChunk.thinking(text, thinking_metadata(data))]
+
+        if text == "",
+          do: [],
+          else: [ReqLLM.StreamChunk.thinking(text, thinking_metadata(data, model.provider))]
 
       "response.reasoning_summary_text.delta" ->
         text = data["delta"] || ""
-        if text == "", do: [], else: [ReqLLM.StreamChunk.thinking(text, thinking_metadata(data))]
+
+        if text == "",
+          do: [],
+          else: [ReqLLM.StreamChunk.thinking(text, thinking_metadata(data, model.provider))]
 
       "response.reasoning_summary_text.done" ->
         []
@@ -196,7 +202,11 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
         handle_output_item_done(data)
 
       "response.completed" ->
-        capture_completion_metadata(data, %{terminal?: true, finish_reason: :stop})
+        capture_completion_metadata(
+          data,
+          %{terminal?: true, finish_reason: :stop},
+          model.provider
+        )
 
       "response.incomplete" ->
         reason =
@@ -204,10 +214,14 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
             data["reason"] ||
             "incomplete"
 
-        capture_completion_metadata(data, %{
-          terminal?: true,
-          finish_reason: normalize_finish_reason(reason)
-        })
+        capture_completion_metadata(
+          data,
+          %{
+            terminal?: true,
+            finish_reason: normalize_finish_reason(reason)
+          },
+          model.provider
+        )
 
       _ ->
         []
@@ -254,7 +268,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     decode_stream_event(event, model)
   end
 
-  defp capture_completion_metadata(data, meta) do
+  defp capture_completion_metadata(data, meta, provider) do
     usage_data = get_in(data, ["response", "usage"])
     response_id = get_in(data, ["response", "id"])
     response_output = get_in(data, ["response", "output"]) || []
@@ -286,7 +300,10 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     meta = Map.merge(meta, extract_assistant_phase_metadata(response_output))
 
     meta =
-      maybe_put_reasoning_details(meta, extract_reasoning_details_from_segments(response_output))
+      maybe_put_reasoning_details(
+        meta,
+        extract_reasoning_details_from_segments(response_output, provider)
+      )
 
     meta = merge_code_interpreter_meta(meta, response_output)
 
@@ -655,6 +672,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   def build_request_body(context, model_name, opts, request) do
     opts_map = if is_map(opts), do: opts, else: Map.new(opts)
     provider_opts = opts_map[:provider_options] || []
+    target_provider = request_provider(request)
 
     store = Keyword.get(provider_opts, :store, default_store(model_name))
 
@@ -682,7 +700,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
             {input_acc, [msg | tool_acc], reasoning_acc}
 
           :assistant ->
-            new_reasoning = encode_reasoning_details_from_message(msg)
+            new_reasoning = encode_reasoning_details_from_message(msg, target_provider)
             assistant_items = encode_assistant_message_items(msg)
             function_calls = encode_tool_calls_as_function_calls(msg.tool_calls || [])
 
@@ -941,18 +959,49 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp encode_input_content_part(_, _type), do: []
 
-  defp encode_reasoning_details_from_message(%ReqLLM.Message{reasoning_details: nil}), do: []
-  defp encode_reasoning_details_from_message(%ReqLLM.Message{reasoning_details: []}), do: []
+  defp encode_reasoning_details_from_message(
+         %ReqLLM.Message{reasoning_details: nil},
+         _target_provider
+       ),
+       do: []
 
-  defp encode_reasoning_details_from_message(%ReqLLM.Message{reasoning_details: details}) do
+  defp encode_reasoning_details_from_message(
+         %ReqLLM.Message{reasoning_details: []},
+         _target_provider
+       ),
+       do: []
+
+  defp encode_reasoning_details_from_message(
+         %ReqLLM.Message{reasoning_details: details},
+         target_provider
+       ) do
     details
     |> Enum.sort_by(& &1.index)
-    |> Enum.flat_map(&encode_single_reasoning_detail/1)
+    |> Enum.flat_map(&encode_single_reasoning_detail(&1, target_provider))
   end
 
   defp encode_single_reasoning_detail(
-         %ReqLLM.Message.ReasoningDetails{provider: :openai} = detail
+         %ReqLLM.Message.ReasoningDetails{provider: provider} = detail,
+         provider
+       )
+       when provider in [:openai, :meta] do
+    encode_responses_reasoning_detail(detail)
+  end
+
+  defp encode_single_reasoning_detail(
+         %ReqLLM.Message.ReasoningDetails{provider: provider},
+         target_provider
        ) do
+    Logger.debug(
+      "Skipping reasoning detail from provider #{inspect(provider)} for #{inspect(target_provider)} request"
+    )
+
+    []
+  end
+
+  defp encode_single_reasoning_detail(_, _target_provider), do: []
+
+  defp encode_responses_reasoning_detail(detail) do
     item = %{"type" => "reasoning"}
 
     item =
@@ -978,13 +1027,6 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     [item]
   end
-
-  defp encode_single_reasoning_detail(%ReqLLM.Message.ReasoningDetails{provider: provider}) do
-    Logger.debug("Skipping non-OpenAI reasoning detail from provider: #{inspect(provider)}")
-    []
-  end
-
-  defp encode_single_reasoning_detail(_), do: []
 
   # ========================================================================
 
@@ -1462,6 +1504,13 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp request_model(_), do: nil
 
+  defp request_provider(request) do
+    case request_model(request) do
+      %{provider: provider} when is_atom(provider) -> provider
+      _other -> :openai
+    end
+  end
+
   defp lookup_request_model(request) do
     model_name = request.options[:model] || request.options[:id]
 
@@ -1716,11 +1765,12 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     body = ReqLLM.Provider.Utils.ensure_parsed_body(resp.body)
 
     output_segments = body["output"] || []
+    model = response_materialization_model(req, body)
 
     text = aggregate_output_segments(body, output_segments)
     thinking = aggregate_reasoning_segments(output_segments)
     tool_calls = extract_tool_calls_from_segments(output_segments)
-    reasoning_details = extract_reasoning_details_from_segments(output_segments)
+    reasoning_details = extract_reasoning_details_from_segments(output_segments, model.provider)
     code_interpreter_items = extract_code_interpreter_items(output_segments)
 
     base_usage = %{
@@ -1756,8 +1806,6 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       |> put_code_interpreter_meta(code_interpreter_items)
 
     ctx = req.options[:context] || %ReqLLM.Context{messages: []}
-    model = response_materialization_model(req, body)
-
     chunks = buffered_response_chunks(text, thinking, tool_calls, reasoning_details)
 
     metadata = %{
@@ -2101,7 +2149,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     ReqLLM.ToolCall.new_builtin(id, type, args_json)
   end
 
-  defp extract_reasoning_details_from_segments(segments) do
+  defp extract_reasoning_details_from_segments(segments, provider) do
     segments
     |> Enum.filter(&(&1["type"] == "reasoning"))
     |> Enum.with_index()
@@ -2112,7 +2160,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
         text: summary_text,
         signature: seg["encrypted_content"],
         encrypted?: seg["encrypted_content"] != nil,
-        provider: :openai,
+        provider: provider,
         format: "openai-responses-v1",
         index: index,
         provider_data: %{"id" => seg["id"], "type" => "reasoning"}
@@ -2449,11 +2497,11 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   defp valid_assistant_phase?(phase) when phase in @assistant_phases, do: true
   defp valid_assistant_phase?(_), do: false
 
-  defp thinking_metadata(data) do
+  defp thinking_metadata(data, provider) do
     %{
       signature: data["encrypted_content"],
       encrypted?: data["encrypted_content"] != nil,
-      provider: :openai,
+      provider: provider,
       format: "openai-responses-v1",
       provider_data: %{"type" => "reasoning", "id" => data["id"]}
     }
