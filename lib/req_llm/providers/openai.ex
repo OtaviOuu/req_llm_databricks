@@ -593,13 +593,18 @@ defmodule ReqLLM.Providers.OpenAI do
         json_schema
       end
 
+    json_schema_map = %{name: schema_name, schema: json_schema}
+
+    json_schema_map =
+      if strict do
+        Map.put(json_schema_map, :strict, true)
+      else
+        json_schema_map
+      end
+
     response_format = %{
       type: "json_schema",
-      json_schema: %{
-        name: schema_name,
-        strict: strict,
-        schema: json_schema
-      }
+      json_schema: json_schema_map
     }
 
     opts_with_format =
